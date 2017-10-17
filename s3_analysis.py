@@ -5,95 +5,25 @@ import datetime
 import boto3
 import argparse
 import logging
-
+from bucket import Bucket
+from my_thread import ThreadPool
 
 class report(object):
-    def __init__(self, logger, creds_file='~/.aws/credentials', exclude_b=None, include_b=None, file_count=None, sort_order="newest"):
+    def __init__(self, logger, creds_file='~/.aws/credentials', exclude_b=None, include_b=None, file_count=None, sort_order="newest", workers=10, acct_profile=None):
+        self.acct_profile  = acct_profile
         self.include = include_b
         self.exclude = exclude_b
         self.sort_order = sort_order
-        self.bucket_list = self.get_bucket_list(self.get_account_profiles(creds_file))
+        self.workers = workers
+        self.bucket_list = []
 
-
-    class bucket(object):
-        def __init__(self, bucket_name, create_date, session_obj, sort_order):
-            self.session = session_obj
-            self.bucket_name = bucket_name
-            self.creation_date = create_date
-            try:
-                self.bucket_region = session_obj.client('s3').get_bucket_location(Bucket=bucket_name)['LocationConstraint']
-            except Exception,e:
-                logger.error("Unable to get bucket location from bucket {} with Error: {}".format(self.bucket_name,e))
-                self.bucket_region = 'Unknown'
-                self.last_modified = self.creation_date
-                self.total_file_size = 0
-                self.file_count = 0
-                self.sorted_keys = []
-                self.message = "Unknown you may be unable to list contents of this bucket."
-            self.sort_order = sort_order
-            self.all_keys = self.get_all_keys()
-            if self.all_keys == None:
-                self.last_modified = self.creation_date
-                self.total_file_size = 0
-                self.file_count = 0
-                self.sorted_keys = []
-                self.message = "Unknown you may be unable to list contents of this bucket."
-            else:
-                self.last_modified, self.total_file_size, self.file_count, self.sorted_keys = self.get_details(self.all_keys)
-                self.message = ""
-            if not self.last_modified:
-                self.last_modified = self.creation_date
-            logger.info("Bucket {} was created on {} and was last modified on {}.\nIt has {} files totaling {} bytes.".format(
-                    self.bucket_name,
-                    datetime.datetime.strftime(self.creation_date, '%m-%d-%Y'),
-                    datetime.datetime.strftime(self.last_modified, '%m-%d-%Y'),
-                    self.file_count,self.total_file_size))
-
-
-        def get_all_keys(self):
-            keys = []
-            try:
-                paginator = self.session.client('s3',region_name=self.bucket_region).get_paginator('list_objects')
-                page_iterator = paginator.paginate(Bucket=self.bucket_name)
-                for page in page_iterator:
-                    contents = page.get('Contents',None)
-                    if contents:
-                        for pk in contents:
-                            keys.append({
-                                'Key': pk['Key'],
-                                'LastModified': pk['LastModified'],
-                                'Size': pk['Size']
-                                },)
-                    else:
-                        logger.info("{} is an empty Bucket and will be Excluded".format(self.bucket_name))
-            except Exception,e:
-                logger.error("Unable to list keys from bucket {} with Error: {}".format(self.bucket_name,e))
-                return None
-            return keys
-
-        def get_details(self, all_keys):
-            total_size = 0
-            file_count = len(all_keys)
-            get_last_modified = lambda obj: obj['LastModified']
-
-            oldest = sorted(all_keys, key=get_last_modified)
-            newest = sorted(all_keys, key=get_last_modified, reverse=True)
-
-            if self.sort_order == 'oldest':
-                sorted_keys = oldest
-            else:
-                sorted_keys = newest
-
-            if file_count > 0:
-                key_lm = newest[0]['LastModified']
-                for key in all_keys:
-                    total_size += key['Size']
-            else:
-                key_lm = None
-
-            return key_lm, total_size, file_count, sorted_keys
-
-
+        if self.acct_profile:
+            logger.info("Verifying that {} profile can be found in {}".format(self.acct_profile, creds_file))
+            self.verify_account_profile(self.acct_profile, creds_file)
+            self.get_bucket_list([self.acct_profile])
+        else:
+            logger.info("Finding all account profiles in {}.".format(creds_file))
+            self.get_bucket_list(self.get_account_profiles(creds_file))
 
     def get_account_profiles(self, creds_file):
         account_profiles = []
@@ -109,7 +39,7 @@ class report(object):
             with open(full_path, "r") as f:
                 contents = f.read()
             for line in contents.split('\n'):
-                if '[' in line:
+                if line.strip().startswith('[') and line.strip().endswith(']'):
                     tmp_profile = line.replace('[', '').replace(']', '')
                     logger.info("From {} extracted account profile named {}".format(line, tmp_profile))
                     account_profiles.append(tmp_profile)
@@ -118,8 +48,12 @@ class report(object):
 
         return account_profiles
 
+    def get_buckets(self, name, creation, session, sort_order, logger):
+        self.bucket_list.append(Bucket(name, creation, session, sort_order, logger))
+
     def get_bucket_list(self, account_profiles):
         buckets = []
+        pool = ThreadPool(self.workers)
         for profile in account_profiles:
             session = boto3.Session(profile_name=profile)
             s3_client = session.client('s3')
@@ -139,18 +73,38 @@ class report(object):
                     for bd in bucket_list:
                         if i in bd['Name']:
                             logger.info("Found and including bucket {}".format(bd['Name']))
-                            create_date = bd['CreationDate']
-                            buckets.append(self.bucket(bd['Name'], create_date, session, self.sort_order))
+                            buckets.append({
+                                    'Name': bd['Name'],
+                                    'CreationDate': bd['CreationDate']
+                                    },)
+                    for bucket in buckets:
+                        pool.add_task(self.get_buckets,bucket['Name'],bucket['CreationDate'],session,self.sort_order,logger)
             else:
                 for bd in bucket_list:
                     logger.info("Including bucket {}".format(bd['Name']))
-                    create_date = bd['CreationDate']
-                    buckets.append(self.bucket(bd['Name'], create_date, session, self.sort_order))
+                    pool.add_task(self.get_buckets,bd['Name'], bd['CreationDate'], session, self.sort_order,logger)
+            pool.wait_completion()
 
-        return buckets
+    def verify_account_profile(self, acct_profile, creds_file):
+        found_match = False
+        if '~/' in creds_file:
+            full_path = os.path.expanduser(creds_file)
+        else:
+            full_path = os.path.abspath(creds_file)
 
-        # def get_
+        logger.info("Full path for credentials file is {}".format(full_path))
 
+        if os.path.exists(full_path):
+            os.environ['AWS_SHARED_CREDENTIALS_FILE'] = full_path
+            with open(full_path, "r") as f:
+                contents = f.read()
+            for line in contents.split('\n'):
+                if acct_profile in line:
+                    found_match = True
+        if found_match:
+            return True
+        else:
+            sys.exit("Unable to find profile {} in {}".format(self.acct_profile, creds_file))
 
 def analysis_log(log_file):
     logger = logging.getLogger('s3_analysis')
@@ -180,6 +134,8 @@ if __name__ == "__main__":
                         help=("Directory for log to be created"))
 
     # Script actions
+    parser.add_argument("--acct-profile", action="store", default = None,
+                        help="If you have multiple accounts in your creds file and only want to get ")
     parser.add_argument("--creds", action="store", default="~/.aws/credentials",
                         help="Input the location of your AWS credentials file.  See http://docs.aws.amazon.com/cli/latest/userguide/cli-config-files.html for file formatting information.")
     parser.add_argument("--exclude-bucket", action="store", default=None, nargs='+',
@@ -194,6 +150,8 @@ if __name__ == "__main__":
                         help="Sorting order either \"newest\" or \"oldest\"")
     parser.add_argument("--output", action="store", default='screen',
                         help="Your desired output type either \"screen\", \"csv\", or \"tab\"")
+    parser.add_argument("--workers", action="store", default=10,
+                        help="Your desired amount of workers to speed up the process")
 
     args = parser.parse_args()
     analysis_log(args.log_dir + args.filename)
@@ -237,13 +195,21 @@ if __name__ == "__main__":
     else:
         sys.exit("Sorry I can't support that size format.  Please check your input either that or you just need to cool it with the data storage, homie.")
 
+    if args.workers:
+        try:
+           workers = int(args.workers)
+        except:
+            sys.exit("I can't cast your number of files to an int, please review your input")
+
     s3_report = report(
         logger,
         args.creds,
         args.exclude_bucket,
         args.include_bucket,
         args.size_format,
-        args.sort)
+        args.sort,
+        workers,
+        args.acct_profile)
 
     get_last_modified = lambda obj: obj.creation_date
     if args.sort == 'oldest':
@@ -253,13 +219,13 @@ if __name__ == "__main__":
 
     for bucket in sorted_buckets:
         print "------------------------------------------------------------------------------------------------------------------------------------"
-        print bucket.bucket_name," ",bucket.total_file_size/div," ",datetime.datetime.strftime(bucket.last_modified, '%m-%d-%Y %H:%M:%S')," ",bucket.message
+        print bucket.bucket_name," ",bucket.total_file_size/div,args.size_format," ",datetime.datetime.strftime(bucket.last_modified, '%m-%d-%Y %H:%M:%S')," ",bucket.message
         print "------------------------------------------------------------------------------------------------------------------------------------"
         if args.files:
             for index, key in enumerate(bucket.sorted_keys):
-                print bucket.bucket_name,delim,key['Key'],delim,datetime.datetime.strftime(key['LastModified'], '%m-%d-%Y %H:%M:%S'),delim,key['Size']/div
+                print bucket.bucket_name,delim,key.key,delim,datetime.datetime.strftime(key.last_modified, '%m-%d-%Y %H:%M:%S'),delim,key.size/div,args.size_format
                 if index == num_of_files-1:
                     break
         else:
             for key in bucket.sorted_keys:
-                print bucket.bucket_name,delim,key['Key'],delim,datetime.datetime.strftime(key['LastModified'], '%m-%d-%Y %H:%M:%S'),delim,key['Size']/div
+                print bucket.bucket_name,delim,key.key,delim,datetime.datetime.strftime(key.last_modified, '%m-%d-%Y %H:%M:%S'),delim,key.size/div,args.size_format
