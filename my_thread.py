@@ -1,4 +1,4 @@
-from Queue import Queue
+from asyncio import Queue
 from threading import Thread
 
 class Worker(Thread):
@@ -12,8 +12,8 @@ class Worker(Thread):
         while True:
             func, args, kargs = self.tasks.get()
             try: func(*args, **kargs)
-            except Exception, e:
-                print "Unable to run worker: {}".format(e)
+            except Exception as e:
+                print ("Unable to run worker: {}".format(e))
             self.tasks.task_done()
 
 class ThreadPool(object):

@@ -1,12 +1,12 @@
-#!/usr/bin/env python2.7
+#!/usr/bin/env python3
 import os
 import sys
 import datetime
 import boto3
 import argparse
 import logging
+import asyncio
 from bucket import Bucket
-from my_thread import ThreadPool
 
 class report(object):
     def __init__(self, logger, creds_file='~/.aws/credentials', exclude_b=None, include_b=None, file_count=None, sort_order="newest", workers=10, acct_profile=None):
@@ -48,12 +48,8 @@ class report(object):
 
         return account_profiles
 
-    def get_buckets(self, name, creation, session, sort_order, logger):
-        self.bucket_list.append(Bucket(name, creation, session, sort_order, logger))
-
     def get_bucket_list(self, account_profiles):
         buckets = []
-        pool = ThreadPool(self.workers)
         for profile in account_profiles:
             session = boto3.Session(profile_name=profile)
             s3_client = session.client('s3')
@@ -78,12 +74,11 @@ class report(object):
                                     'CreationDate': bd['CreationDate']
                                     },)
                     for bucket in buckets:
-                        pool.add_task(self.get_buckets,bucket['Name'],bucket['CreationDate'],session,self.sort_order,logger)
+                        self.bucket_list.append(Bucket.async_create_bucket(Bucket.create_bucket(bucket['Name'],bucket['CreationDate'],session,self.sort_order,logger,logger)))
             else:
                 for bd in bucket_list:
                     logger.info("Including bucket {}".format(bd['Name']))
-                    pool.add_task(self.get_buckets,bd['Name'], bd['CreationDate'], session, self.sort_order,logger)
-            pool.wait_completion()
+                    self.bucket_list.append(Bucket.async_create_bucket(Bucket.create_bucket(bd['Name'], bd['CreationDate'], session, self.sort_order,logger,logger)))
 
     def verify_account_profile(self, acct_profile, creds_file):
         found_match = False
@@ -211,21 +206,21 @@ if __name__ == "__main__":
         workers,
         args.acct_profile)
 
-    get_last_modified = lambda obj: obj.creation_date
+    get_last_modified = lambda obj: obj.last_modified
     if args.sort == 'oldest':
         sorted_buckets = sorted(s3_report.bucket_list, key=get_last_modified, reverse=True)
     else:
         sorted_buckets = sorted(s3_report.bucket_list, key=get_last_modified)
 
     for bucket in sorted_buckets:
-        print "------------------------------------------------------------------------------------------------------------------------------------"
-        print bucket.bucket_name," ",bucket.total_file_size/div,args.size_format," ",datetime.datetime.strftime(bucket.last_modified, '%m-%d-%Y %H:%M:%S')," ",bucket.message
-        print "------------------------------------------------------------------------------------------------------------------------------------"
+        print ("------------------------------------------------------------------------------------------------------------------------------------")
+        print (bucket.bucket_name," ",bucket.total_file_size/div,args.size_format," ",datetime.datetime.strftime(bucket.last_modified, '%m-%d-%Y %H:%M:%S')," ",bucket.message)
+        print ("------------------------------------------------------------------------------------------------------------------------------------")
         if args.files:
             for index, key in enumerate(bucket.sorted_keys):
-                print bucket.bucket_name,delim,key.key,delim,datetime.datetime.strftime(key.last_modified, '%m-%d-%Y %H:%M:%S'),delim,key.size/div,args.size_format
+                print (bucket.bucket_name,delim,key['Key'],delim,datetime.datetime.strftime(key['LastModified'], '%m-%d-%Y %H:%M:%S'),delim,key['Size']/div,args.size_format)
                 if index == num_of_files-1:
                     break
         else:
             for key in bucket.sorted_keys:
-                print bucket.bucket_name,delim,key.key,delim,datetime.datetime.strftime(key.last_modified, '%m-%d-%Y %H:%M:%S'),delim,key.size/div,args.size_format
+                print (bucket.bucket_name,delim,key['Key'],delim,datetime.datetime.strftime(key['LastModified'], '%m-%d-%Y %H:%M:%S'),delim,key['Size']/div,args.size_format)
