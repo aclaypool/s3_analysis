@@ -5,8 +5,10 @@ import datetime
 import boto3
 import argparse
 import logging
+import itertools
+import multiprocessing
 from bucket import Bucket
-from my_thread import ThreadPool
+from subprocess import Popen, PIPE
 
 class report(object):
     def __init__(self, logger, creds_file='~/.aws/credentials', exclude_b=None, include_b=None, file_count=None, sort_order="newest", workers=10, acct_profile=None):
@@ -19,6 +21,8 @@ class report(object):
         self.sort_order = sort_order
         self.workers = workers
         self.bucket_list = []
+        self.key_cmds = []
+        self.cmd_output = []
 
         if self.acct_profile:
             self.logger.info("Verifying that {} profile can be found in {}".format(self.acct_profile, creds_file))
@@ -27,6 +31,8 @@ class report(object):
         else:
             self.logger.info("Finding all account profiles in {}.".format(creds_file))
             self.get_bucket_list(self.get_account_profiles())
+
+        self.get_keys()
 
     def get_account_profiles(self):
         if '~/' in self.creds_file:
@@ -50,12 +56,7 @@ class report(object):
 
         return self.account_profiles
 
-    def get_buckets(self, name, creation, session, sort_order):
-        self.bucket_list.append(Bucket(name, creation, session, sort_order, self.logger))
-
     def get_bucket_list(self, account_profiles):
-
-        pool = ThreadPool(self.workers)
         for profile in account_profiles:
             buckets = []
             session = boto3.Session(profile_name=profile)
@@ -81,12 +82,28 @@ class report(object):
                                     'CreationDate': bd['CreationDate']
                                     },)
                 for bucket in buckets:
-                    pool.add_task(self.get_buckets(bucket['Name'],bucket['CreationDate'],session,self.sort_order))
+                    self.key_cmds.append('echo '+bucket['Name']+'&& aws s3api list-objects --bucket '+bucket['Name']+' --query \'Contents[].{Key: Key, Size:Size, LastModified:LastModified}\' --profile '+profile+' --output json')
+                    self.bucket_list.append(Bucket(bd['Name'], bd['CreationDate'], session, self.sort_order, self.logger))
             else:
                 for bd in bucket_list:
                     self.logger.info("Including bucket {}".format(bd['Name']))
-                    pool.add_task(self.get_buckets(bd['Name'], bd['CreationDate'], session, self.sort_order))
-        pool.wait_completion()
+                    self.key_cmds.append('echo '+bucket['Name']+'&& aws s3api list-objects --bucket '+bucket['Name']+' --query \'Contents[].{Key: Key, Size:Size, LastModified:LastModified}\' --profile '+profile+' --output json')
+                    self.bucket_list.append(Bucket(bd['Name'], bd['CreationDate'], session, self.sort_order, self.logger))
+
+    def get_keys(self):
+        processes = (Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE) for cmd in self.key_cmds)
+        rn_processes = list(itertools.islice(processes, self.workers))
+        while rn_processes:
+            print "thing"
+            for i, process in enumerate(rn_processes):
+                print "thing2"
+                if process.poll() is not None:
+                    stdout, stderr = [out.strip() for out in process.communicate()]
+                    self.cmd_output.append(stdout)
+                    rn_processes[i] = next(processes,None)
+                    if rn_processes[i] is None:
+                       del rn_processes[i]
+                       break
 
     def verify_account_profile(self):
         found_match = False
@@ -126,6 +143,7 @@ def analysis_logs_out():
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     parser = argparse.ArgumentParser(description="This is used to get that bucket info",
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     # General arguments
