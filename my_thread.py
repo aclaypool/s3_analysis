@@ -11,15 +11,18 @@ class Worker(Thread):
     def run(self):
         while True:
             func, args, kargs = self.tasks.get()
-            try: func(*args, **kargs)
-            except Exception, e:
-                print "Unable to run worker: {}".format(e)
+            if func:
+                try:
+                    func(*args, **kargs)
+                except Exception, e:
+                    print "Unable to run worker: {} Function: {} Args: {}".format(e, func, args)
             self.tasks.task_done()
 
 class ThreadPool(object):
     def __init__(self, num_threads):
         self.tasks = Queue(num_threads)
-        for _ in range(num_threads): Worker(self.tasks)
+        for _ in range(num_threads):
+            Worker(self.tasks)
 
     def add_task(self, func, *args, **kargs):
         self.tasks.put((func, args, kargs))
