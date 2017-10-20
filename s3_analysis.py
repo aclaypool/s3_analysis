@@ -8,8 +8,9 @@ import logging
 from bucket import Bucket
 from my_thread import ThreadPool
 
+# Class report for storage of bucket reports
 class report(object):
-    def __init__(self, logger, creds_file='~/.aws/credentials', exclude_b=None, include_b=None, file_count=None, sort_order="newest", workers=10, acct_profile=None):
+    def __init__(self, logger, creds_file='~/.aws/credentials', exclude_b=None, include_b=None, slower=False, file_count=None, sort_order="newest", workers=10, acct_profile=None):
         self.logger = logger
         self.account_profiles = []
         self.creds_file = creds_file
@@ -19,7 +20,9 @@ class report(object):
         self.sort_order = sort_order
         self.workers = workers
         self.bucket_list = []
+        self.slower = slower
 
+        # handling cases of one profile or use all profiles in file
         if self.acct_profile:
             self.logger.info("Verifying that {} profile can be found in {}".format(self.acct_profile, creds_file))
             self.verify_account_profile()
@@ -27,7 +30,7 @@ class report(object):
         else:
             self.logger.info("Finding all account profiles in {}.".format(creds_file))
             self.get_bucket_list(self.get_account_profiles())
-
+    # scraping account profiles from the credentials file
     def get_account_profiles(self):
         if '~/' in self.creds_file:
             full_path = os.path.expanduser(self.creds_file)
@@ -49,10 +52,10 @@ class report(object):
             sys.exit("Unable to locate the provided creds file. Please verify that it exists and that you have permissions to read.")
 
         return self.account_profiles
-
-    def get_buckets(self, name, creation, session, sort_order):
-        self.bucket_list.append(Bucket(name, creation, session, sort_order, self.logger))
-
+    # function multithreading attempt that failed spectacularly once in introduced using os calls
+    def get_buckets(self, profile, name, creation, slower, session, sort_order):
+        self.bucket_list.append(Bucket(profile, name, creation, self.slower, session, sort_order, self.logger))
+    # Grabbing list of buckets from all accounts
     def get_bucket_list(self, account_profiles):
 
         pool = ThreadPool(self.workers)
@@ -62,6 +65,7 @@ class report(object):
             s3_client = session.client('s3')
             bucket_list = s3_client.list_buckets()['Buckets']
 
+            # Immediately removing and excluded buckets
             if self.exclude != None:
                 for e in self.exclude:
                     logger.info("Excluding buckets named {}".format(e))
@@ -69,7 +73,7 @@ class report(object):
                         if e in bd['Name']:
                             logger.info("Found and excluding bucket {}.".format(bd['Name']))
                             bucket_list.remove(bd)
-
+            # Only including desired buckets
             if self.include != None:
                 for i in self.include:
                     self.logger.info("Including any buckets matching {} from account {}.".format(i,profile))
@@ -81,13 +85,15 @@ class report(object):
                                     'CreationDate': bd['CreationDate']
                                     },)
                 for bucket in buckets:
-                    pool.add_task(self.get_buckets(bucket['Name'],bucket['CreationDate'],session,self.sort_order))
+                    pool.add_task(self.get_buckets(profile,bucket['Name'],bucket['CreationDate'],self.slower,session,self.sort_order))
+            # Going ahead with all buckets otherwise
             else:
                 for bd in bucket_list:
                     self.logger.info("Including bucket {}".format(bd['Name']))
-                    pool.add_task(self.get_buckets(bd['Name'], bd['CreationDate'], session, self.sort_order))
+                    pool.add_task(self.get_buckets(profile,bd['Name'], bd['CreationDate'],self.slower,session, self.sort_order))
         pool.wait_completion()
 
+    # Verifying the profile exists in credentials file
     def verify_account_profile(self):
         found_match = False
         if '~/' in self.creds_file:
@@ -108,7 +114,7 @@ class report(object):
             return True
         else:
             sys.exit("Unable to find profile {} in {}".format(self.acct_profile, self.creds_file))
-
+# Log setup
 def analysis_log(log_file):
     logger = logging.getLogger('s3_analysis')
     logFileHandler = logging.FileHandler(log_file)
@@ -116,7 +122,7 @@ def analysis_log(log_file):
     logFileHandler.setFormatter(logFormatter)
     logger.addHandler(logFileHandler)
 
-
+# System out, if so desired
 def analysis_logs_out():
     logger = logging.getLogger('s3_analysis')
     logFormatter = logging.Formatter('%(levelname)s: %(message)s')
@@ -143,7 +149,7 @@ if __name__ == "__main__":
                         help="Input the location of your AWS credentials file.  See http://docs.aws.amazon.com/cli/latest/userguide/cli-config-files.html for file formatting information.")
     parser.add_argument("--exclude-bucket", action="store", default=None, nargs='+',
                         help="Space seperated list of buckets to exclude")
-    parser.add_argument("--files", action="store", default=None,
+    parser.add_argument("--files", action="store", default=20,
                         help="Number of files to list")
     parser.add_argument("--include-bucket", action="store", default=None, nargs='+',
                         help="Space seperated list of buckets to include")
@@ -155,19 +161,24 @@ if __name__ == "__main__":
                         help="Your desired output type either \"screen\", \"csv\", or \"tab\"")
     parser.add_argument("--workers", action="store", default=10,
                         help="Your desired amount of workers to speed up the process")
+    parser.add_argument("--slower", action="store", default=False,
+                        help="aws s3api is faster than my code and uses less RAM")
 
     args = parser.parse_args()
     analysis_log(args.log_dir + args.filename)
     logger = logging.getLogger('s3_analysis')
     logger.setLevel(logging.INFO)
 
+    # Log to stdout if so desired
     if args.stdout:
         analysis_logs_out()
+    # Number of files to list if it can't cast to an int exit
     if args.files:
         try:
             num_of_files = int(args.files)
         except:
             sys.exit("I can't cast your number of files to an int, please review your input")
+    # Optional output options for redirecting to file.  why not json and only json?
     if args.output == 'tab':
         delim = '\t'
     elif args.output == 'csv':
@@ -175,16 +186,21 @@ if __name__ == "__main__":
     else:
         delim = '\t\t'
 
+    # in case sort input is conflicting
     if args.sort != 'oldest' and args.sort != 'newest':
         sys.exit("I don't think I can sort by {} please enter \"oldest\" or \"newest\"".format(args.sort))
-
+    # incase told to include exclude the same buckets
     if args.include_bucket and args.exclude_bucket:
-        if args.include_bucket == args.exclude_bucket:
-            sys.exit("You're including and excluding the same buckets. Nothing to do here.")
-        for i in args.include_bucket:
-            if i in args.exclude_bucket:
-                sys.exit("You're including and excluding some of the same buckets. Maybe give your lists another look.")
+        sys.exit("Please don't use exclude and exclude")
+    # If we can't use the cli
+    if args.slower:
+        try:
+            if not os.popen('aws 2>&1','r').read().split('\n')[0].startswith('usage:'):
+                os.popen('easy_install awscli', 'r')
+        except Exception,e:
+            logger.error(e)
 
+    # Getting size format to divide bytes by
     if args.size_format == 'bytes':
         div = 1.0
     elif args.size_format == 'KB':
@@ -203,17 +219,19 @@ if __name__ == "__main__":
            workers = int(args.workers)
         except:
             sys.exit("I can't cast your number of files to an int, please review your input")
-
+    # Init report class
     s3_report = report(
         logger,
         args.creds,
         args.exclude_bucket,
         args.include_bucket,
+        args.slower,
         args.size_format,
         args.sort,
         workers,
         args.acct_profile)
 
+    # Sort bucket by created date
     get_last_modified = lambda obj: obj.creation_date
     if args.sort == 'oldest':
         sorted_buckets = sorted(s3_report.bucket_list, key=get_last_modified, reverse=True)
@@ -221,14 +239,13 @@ if __name__ == "__main__":
         sorted_buckets = sorted(s3_report.bucket_list, key=get_last_modified)
 
     for bucket in sorted_buckets:
+        # Out put report
         print "------------------------------------------------------------------------------------------------------------------------------------"
         print bucket.bucket_name," ",bucket.total_file_size/div,args.size_format," ",datetime.datetime.strftime(bucket.last_modified, '%m-%d-%Y %H:%M:%S')," ",bucket.message
         print "------------------------------------------------------------------------------------------------------------------------------------"
-        if args.files:
-            for index, key in enumerate(bucket.sorted_keys):
-                print bucket.bucket_name,delim,key.key,delim,datetime.datetime.strftime(key.last_modified, '%m-%d-%Y %H:%M:%S'),delim,key.size/div,args.size_format
-                if index == num_of_files-1:
-                    break
-        else:
-            for key in bucket.sorted_keys:
-                print bucket.bucket_name,delim,key.key,delim,datetime.datetime.strftime(key.last_modified, '%m-%d-%Y %H:%M:%S'),delim,key.size/div,args.size_format
+        for index, key in enumerate(bucket.sorted_keys):
+            if isinstance(key['LastModified'],unicode):
+                key['LastModified'] = datetime.datetime.strptime(key['LastModified'],'%Y-%m-%dT%H:%M:%S.%fZ')
+            print bucket.bucket_name,delim,key['Key'],delim,datetime.datetime.strftime(key['LastModified'], '%m-%d-%Y %H:%M:%S'),delim,key['Size']/div,args.size_format
+            if index == num_of_files-1:
+                break
